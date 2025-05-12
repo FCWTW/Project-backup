@@ -28,3 +28,17 @@ import tflite_runtime.interpreter as tflite
 * 推理方法
 * 前處理和後處理邏輯
 * 依賴庫的替換
+
+---
+# neuronpilot_test.py
+
+注意事項：
+* 這是一個通用模板，需要根據您具體的 NeuroPilot SDK 和模型輸出格式客製化
+* 輸出解析邏輯（特別是 outputs[0]）可能需要根據實際模型調整 (neuronrt.Interpreter 的輸出可能與標準 TFLite 不同)
+* compute_iou() 函數可能需要根據框的具體表示方法調整
+* 建議先使用 interpreter.get_output_details() 確認輸出結構
+
+建議：
+* 使用前先詳細檢查模型輸出格式
+* 可能需要多次調試和微調
+* 確保與原始 ROS 節點的檢測結果格式兼容
