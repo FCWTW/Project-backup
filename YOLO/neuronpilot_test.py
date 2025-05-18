@@ -13,65 +13,6 @@ Tool:
 https://netron.app/
 '''
 
-def preprocess_image(image, input_shape=(640, 640)):
-    """
-    為 NeuroPilot YOLO 模型準備輸入圖像
-    Args:
-    image (numpy.ndarray): 原始 BGR 圖像
-    input_shape (tuple): 模型期望的輸入圖像尺寸
-    Returns:
-    numpy.ndarray: 處理後的模型輸入
-    """
-    # 使用 LetterBox 進行預處理，保持縱橫比
-    letterbox = LetterBox(new_shape=input_shape)
-    resized_image = letterbox(image=image)
-    
-    # 確認輸入圖像形狀
-    print(f"調整後的圖像形狀: {resized_image.shape}")
-    
-    # 將圖像轉換為 float32
-    input_data = resized_image.astype(np.float32)
-    
-    # 將 BGR 轉換為 RGB
-    input_data = input_data[..., ::-1]
-    
-    # 歸一化: 像素值範圍從 [0, 255] 縮放到 [0, 1]
-    input_data /= 255.0
-    
-    # 確保數據連續存儲
-    input_data = np.ascontiguousarray(input_data)
-    
-    # 添加 batch 維度
-    input_data = np.expand_dims(input_data, axis=0)
-    
-    print(f"預處理後的輸入形狀: {input_data.shape}, 類型: {input_data.dtype}")
-    return input_data
-
-def postprocess(preds, imgsz, conf_thres=0.25, iou_thres=0.45, classes=None, agnostic=False, multi_label=False, labels=(), max_det=300, nc=0, max_time_img=0.05, max_nms=30000, max_wh=7680, in_place=True, rotated=False):
-    preds[:, [0, 2]] *= imgsz[0] ; preds[:, [1, 3]] *= imgsz[1]
-    xc = np.max(preds[:, 4: nc + 4], axis = 1) > conf_thres
-    preds = np.transpose(preds, (0, 2, 1)) 
-    preds[..., :4] = xywh2xyxy(preds[..., :4])
-    x = preds[0][xc[0]]
-
-    if not x.shape[0]:
-        return None
-    box, cls, keypoints = x[:, :4], x[:, 4:5], x[:, 5:]
-    j = np.argmax(cls, axis=1)
-    conf = cls[[i for i in range(len(j))], j]
-    concatenated = np.concatenate((box, conf.reshape(-1, 1), j.reshape(-1, 1).astype(float), keypoints), axis=1)
-    x = concatenated[conf.flatten() > conf_thres]
-
-    if x.shape[0] > max_nms:  # excess boxes
-        x = x[x[:, 4].argsort(descending=True)[:max_nms]]
-    cls = x[:, 5:6] * (0 if agnostic else max_wh)
-    scores, boxes = x[:, 4], x[:, :4] + cls
-    i = non_max_suppression(boxes, scores, iou_thres)
-    if isinstance(i, list):
-        i = np.array(i)
-
-    return [x[i[:max_det]]]
-        
 class LetterBox:
     def __init__(self, new_shape=(640, 640), auto=False, scaleFill=False, scaleup=True, center=True, stride=32):
         self.new_shape = new_shape
@@ -130,6 +71,72 @@ class LetterBox:
         labels["instances"].scale(*ratio)
         labels["instances"].add_padding(padw, padh)
         return labels
+
+def show_image(title, img):
+    cv2.imshow(title, img)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
+def preprocess_image(image, input_shape=(640, 640)):
+    """
+    為 NeuroPilot YOLO 模型準備輸入圖像
+    Args:
+    image (numpy.ndarray): 原始 BGR 圖像
+    input_shape (tuple): 模型期望的輸入圖像尺寸
+    Returns:
+    numpy.ndarray: 處理後的模型輸入
+    """
+    # 使用 LetterBox 進行預處理，保持縱橫比
+    letterbox = LetterBox(new_shape=input_shape)
+    resized_image = letterbox(image=image)
+
+    show_image("preprocess", resized_image)
+    
+    # 確認輸入圖像形狀
+    print(f"調整後的圖像形狀: {resized_image.shape}")
+    
+    # 將圖像轉換為 float32
+    input_data = resized_image.astype(np.float32)
+    
+    # 將 BGR 轉換為 RGB
+    input_data = input_data[..., ::-1]
+    
+    # 歸一化: 像素值範圍從 [0, 255] 縮放到 [0, 1]
+    input_data /= 255.0
+    
+    # 確保數據連續存儲
+    input_data = np.ascontiguousarray(input_data)
+    
+    # 添加 batch 維度
+    input_data = np.expand_dims(input_data, axis=0)
+    
+    print(f"預處理後的輸入形狀: {input_data.shape}, 類型: {input_data.dtype}")
+    return input_data
+
+def postprocess(preds, imgsz, conf_thres=0.25, iou_thres=0.45, classes=None, agnostic=False, multi_label=False, labels=(), max_det=300, nc=0, max_time_img=0.05, max_nms=30000, max_wh=7680, in_place=True, rotated=False):
+    preds[:, [0, 2]] *= imgsz[0] ; preds[:, [1, 3]] *= imgsz[1]
+    xc = np.max(preds[:, 4: nc + 4], axis = 1) > conf_thres
+    preds = np.transpose(preds, (0, 2, 1)) 
+    preds[..., :4] = xywh2xyxy(preds[..., :4])
+    x = preds[0][xc[0]]
+
+    if not x.shape[0]:
+        return None
+    box, cls, keypoints = x[:, :4], x[:, 4:5], x[:, 5:]
+    j = np.argmax(cls, axis=1)
+    conf = cls[[i for i in range(len(j))], j]
+    concatenated = np.concatenate((box, conf.reshape(-1, 1), j.reshape(-1, 1).astype(float), keypoints), axis=1)
+    x = concatenated[conf.flatten() > conf_thres]
+
+    if x.shape[0] > max_nms:  # excess boxes
+        x = x[x[:, 4].argsort(descending=True)[:max_nms]]
+    cls = x[:, 5:6] * (0 if agnostic else max_wh)
+    scores, boxes = x[:, 4], x[:, :4] + cls
+    i = non_max_suppression(boxes, scores, iou_thres)
+    if isinstance(i, list):
+        i = np.array(i)
+
+    return [x[i[:max_det]]]
 
 def visualizer(image, results, labels, input_shape=(640, 640)):
     if results is None or len(results[0]) == 0:
@@ -269,6 +276,8 @@ def detect_with_neuronpilot(image_path):
     imgsz = (640, 640)  # resize 後輸入網路的大小
     output_details = interpreter.get_output_details()
     output_data = interpreter.get_tensor(output_details[0]['index'])  # shape: (1, 84, 8400)
+    print(output_data[0, :4, 0])
+
     output_data = output_data.transpose(0, 2, 1)
     results = postprocess(output_data, imgsz, conf_thres=0.05, iou_thres=0.45, nc=80)
     
