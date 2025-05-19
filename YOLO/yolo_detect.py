@@ -5,30 +5,21 @@ import time
 import cv_bridge
 import cv2
 import torch
-from sensor_msgs.msg import Image, CameraInfo, PointCloud2, PointField
-from std_msgs.msg import Header
-import sensor_msgs.point_cloud2 as pc2
 from ultralytics import YOLO
 import message_filters
 import numpy as np
 import image_geometry
 import struct
 
-# 檢查CUDA是否可用
-def check_cuda():
-    if torch.cuda.is_available():
-        device = 'cuda'
-        rospy.loginfo(f"使用GPU: {torch.cuda.get_device_name(0)}")
-    else:
-        device = 'cpu'
-        rospy.logwarn("找不到可用的GPU，將使用CPU進行推論")
-    return device
+from sensor_msgs.msg import Image, CameraInfo, PointCloud2, PointField
+from std_msgs.msg import Header
+import sensor_msgs.point_cloud2 as pc2
 
-device = check_cuda()
+device = 'cpu'
 
 # 初始化ROS節點和YOLO模型
 rospy.init_node("yolo_detector_pointcloud")
-detection_model = YOLO("yolo11n.pt").to(device)
+detection_model = YOLO("/root/catkin_ws/src/yolo_ros/yolov8n_float32.tflite").to(device)
 detection_model.fuse()
 
 # 創建影像和點雲發布者
@@ -71,8 +62,7 @@ def callback(rgb_msg, depth_msg, depth_info_msg):
             return
 
         # 3. YOLO推論
-        with torch.cuda.amp.autocast(enabled=(device=='cuda')):
-            det_results = detection_model(rgb_image, verbose=False, conf=0.5)
+        det_results = detection_model(rgb_image, verbose=False, conf=0.5)
         result = det_results[0] if isinstance(det_results, list) else det_results
         boxes = result.boxes
         names = result.names
@@ -261,5 +251,3 @@ rospy.loginfo(f"發布標註影像到: /yolo/detection/image")
 rospy.loginfo(f"發布場景點雲到: /yolo/scene/pointcloud")
 
 rospy.spin()
-
-
