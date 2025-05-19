@@ -113,6 +113,114 @@ def preprocess_image(image, input_shape=(640, 640)):
     print(f"預處理後的輸入形狀: {input_data.shape}, 類型: {input_data.dtype}")
     return input_data
 
+def postprocess(preds, imgsz, conf_thres=0.25, iou_thres=0.45, classes=None, agnostic=False, max_det=300, nc=80):
+    """
+    適用於NeuroPilot SDK的YOLO輸出後處理函數
+    
+    preds: 模型輸出，形狀為(1, 8400, 84)
+    imgsz: 輸入圖像尺寸(寬, 高)
+    conf_thres: 置信度閾值
+    iou_thres: IoU閾值用於非極大值抑制
+    nc: 類別數量
+    """
+    results = []
+    
+    for i, pred in enumerate(preds):  # 遍歷每個batch
+        # 計算每個框的最大類別置信度
+        class_scores = np.max(pred[:, 5:5+nc], axis=1)
+        class_ids = np.argmax(pred[:, 5:5+nc], axis=1)
+        
+        # 篩選出置信度大於閾值的框
+        conf_mask = class_scores > conf_thres
+        filtered_pred = pred[conf_mask]
+        filtered_scores = class_scores[conf_mask]
+        filtered_class_ids = class_ids[conf_mask]
+        
+        print(f"置信度閾值: {conf_thres}")
+        print(f"類別置信度範圍: {np.min(class_scores)} - {np.max(class_scores)}")
+        print(f"篩選後剩餘框數: {filtered_pred.shape[0]}")
+        
+        if filtered_pred.shape[0] == 0:  # 沒有檢測到物體
+            results.append(None)
+            continue
+            
+        # 處理坐標
+        boxes = filtered_pred[:, :4].copy()
+        
+        # 轉換為xyxy格式
+        boxes = xywh2xyxy(boxes)
+        
+        # 將相對坐標轉為絕對坐標
+        boxes[:, [0, 2]] *= imgsz[0]  # x座標乘以寬度
+        boxes[:, [1, 3]] *= imgsz[1]  # y座標乘以高度
+        
+        # 組合結果: [x1, y1, x2, y2, conf, class_id]
+        det = np.column_stack((boxes, filtered_scores, filtered_class_ids))
+        
+        # 執行非極大值抑制
+        if det.shape[0] > 1:
+            boxes, scores = det[:, :4], det[:, 4]
+            nms_indices = non_max_suppression(boxes, scores, iou_thres)
+            if isinstance(nms_indices, list):
+                nms_indices = np.array(nms_indices)
+            det = det[nms_indices[:max_det]]
+        
+        print(f"NMS後剩餘框數: {det.shape[0]}")
+        print(f"檢測到的類別: {np.unique(det[:, 5])}")
+        
+        results.append(det)
+    
+    return results
+
+def visualizer(image, results, labels, input_shape=(640, 640)):
+    """
+    將檢測結果繪製到圖像上
+    
+    image: 原始圖像
+    results: 後處理後的檢測結果
+    labels: 類別標籤列表
+    """
+    if results is None or len(results) == 0 or results[0] is None:
+        return image
+
+    h, w = image.shape[:2]
+    
+    # 處理檢測結果
+    for det in results:
+        if det is None:
+            continue
+        
+        # 繪製每個檢測框
+        for i in range(det.shape[0]):
+            x1, y1, x2, y2, conf, cls_id = det[i]
+            cls_id = int(cls_id)
+            
+            # 確保坐標為整數並在圖像範圍內
+            x1 = max(0, int(x1))
+            y1 = max(0, int(y1))
+            x2 = min(w, int(x2))
+            y2 = min(h, int(y2))
+            
+            # 檢查坐標是否有效
+            if x1 >= x2 or y1 >= y2:
+                continue
+                
+            # 輸出檢測結果
+            cls_name = labels[cls_id] if cls_id < len(labels) else f"class_{cls_id}"
+            print(f'檢測到: {cls_name}, 置信度: {conf:.2f}, 坐標: ({x1}, {y1}, {x2}, {y2})')
+            
+            # 繪製矩形框
+            cv2.rectangle(image, (x1, y1), (x2, y2), color=(0, 255, 0), thickness=2)
+            
+            # 繪製類別標籤
+            label_text = f'{cls_name} {conf:.2f}'
+            label_size = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
+            cv2.rectangle(image, (x1, y1 - label_size[1] - 5), (x1 + label_size[0], y1), (0, 255, 0), -1)
+            cv2.putText(image, label_text, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+    
+    return image
+
+'''
 def postprocess(preds, imgsz, conf_thres=0.25, iou_thres=0.45, classes=None, agnostic=False, multi_label=False, labels=(), max_det=300, nc=0, max_time_img=0.05, max_nms=30000, max_wh=7680, in_place=True, rotated=False):
     preds[:, [0, 2]] *= imgsz[0] ; preds[:, [1, 3]] *= imgsz[1]
     xc = np.max(preds[:, 4: nc + 4], axis = 1) > conf_thres
@@ -124,6 +232,7 @@ def postprocess(preds, imgsz, conf_thres=0.25, iou_thres=0.45, classes=None, agn
         return None
     box, cls, keypoints = x[:, :4], x[:, 4:5], x[:, 5:]
     j = np.argmax(cls, axis=1)
+    print(f'j:{j}')
     conf = cls[[i for i in range(len(j))], j]
     concatenated = np.concatenate((box, conf.reshape(-1, 1), j.reshape(-1, 1).astype(float), keypoints), axis=1)
     x = concatenated[conf.flatten() > conf_thres]
@@ -144,17 +253,20 @@ def visualizer(image, results, labels, input_shape=(640, 640)):
 
     ih, iw = input_shape
     h, w = image.shape[:2]
+    print(f'input shape: {ih}, {iw}')
 
     for bboxes in results[0]:
-        x1 = int(bboxes[0] * w / iw)
-        y1 = int(bboxes[1] * h / ih)
-        x2 = int(bboxes[2] * w / iw)
-        y2 = int(bboxes[3] * h / ih)
+        x1 = max(0, int(bboxes[0]))
+        y1 = max(0, int(bboxes[1]))
+        x2 = min(w, int(bboxes[2]))
+        y2 = min(h, int(bboxes[3]))
+        print(f'x and y in visualizer: {x1}, {x2}, {y1}, {y2}')
         conf, cls = bboxes[4], bboxes[5]
         print(labels[int(cls)])
         cv2.rectangle(image, (x1, y1), (x2, y2), color=(0, 255, 0), thickness=3)
         cv2.putText(image, f'{labels[int(cls)]} {conf:.2f}', (x1, y1 - 2), 0, 1, [0, 255, 0], thickness=2, lineType=cv2.LINE_AA)
     return image
+'''
 
 def xywh2xyxy(x):
     assert x.shape[-1] == 4, f"input shape last dimension expected 4 but input shape is {x.shape}"
@@ -204,6 +316,24 @@ COCO_CLASSES = [
     'remote', 'keyboard', 'cell phone', 'microwave', 'oven', 'toaster', 'sink', 'refrigerator',
     'book', 'clock', 'vase', 'scissors', 'teddy bear', 'hair drier', 'toothbrush'
 ]
+
+def analyze_yolo_output(output_data):
+    """分析YOLO輸出的結構"""
+    print(f"輸出形狀: {output_data.shape}")
+    
+    # 檢查不同部分的值範圍
+    for i in range(0, min(84, output_data.shape[2]), 5):
+        segment = output_data[0, :, i:i+5]
+        print(f"輸出索引 {i}~{i+4} 的值範圍: {np.min(segment)} ~ {np.max(segment)}")
+        print(f"輸出索引 {i}~{i+4} 的非零值百分比: {np.mean(segment != 0) * 100:.2f}%")
+    
+    # 檢查前幾個檢測框的詳細內容
+    for i in range(min(5, output_data.shape[1])):
+        box_data = output_data[0, i]
+        max_class_idx = np.argmax(box_data[5:])
+        max_class_conf = box_data[5 + max_class_idx]
+        print(f"框 {i}: 坐標[{box_data[0]:.4f}, {box_data[1]:.4f}, {box_data[2]:.4f}, {box_data[3]:.4f}], " 
+              f"置信度: {box_data[4]:.4f}, 最高類別: {max_class_idx}, 類別置信度: {max_class_conf:.4f}")
 
 def detect_with_neuronpilot(image_path):
     """
@@ -276,10 +406,10 @@ def detect_with_neuronpilot(image_path):
     imgsz = (640, 640)  # resize 後輸入網路的大小
     output_details = interpreter.get_output_details()
     output_data = interpreter.get_tensor(output_details[0]['index'])  # shape: (1, 84, 8400)
-    print(output_data[0, :4, 0])
 
     output_data = output_data.transpose(0, 2, 1)
-    results = postprocess(output_data, imgsz, conf_thres=0.05, iou_thres=0.45, nc=80)
+    analyze_yolo_output(output_data)
+    results = postprocess(output_data, imgsz, conf_thres=0.25, iou_thres=0.45, nc=80)
     
     # 繪製檢測結果
     print("繪製結果中...")
@@ -289,12 +419,12 @@ def detect_with_neuronpilot(image_path):
     output_path = image_path.rsplit('.', 1)[0] + "_detection.jpg"
     cv2.imwrite(output_path, output_image)
     
-    print(f'偵測到 {len(results[0])} 個物體')
+    # print(f'偵測到 {len(results[0])} 個物體')
     print(f"結果已儲存至: {output_path}")
 
 if __name__ == "__main__":
     # 設定圖像路徑
-    image_path = "data/unnamed.png"
+    image_path = "data/bus.jpg"
     
     # 檢查圖像是否存在
     if not os.path.exists(image_path):
