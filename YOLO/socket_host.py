@@ -1,38 +1,91 @@
-import socket
+import socket, pickle
 import struct
 import cv2
 import numpy as np
 import os
 from utils.neuronpilot import neuronrt
 import time, argparse
-import pickle
+import logging
+from typing import Optional, Tuple, List, Dict, Any
 
-result_data = {
-    "image": jpeg_bytes,   # 帶 bounding box 的 JPEG 圖
-    "boxes": boxes,        # e.g., list of xyxy boxes
-    "names": names         # e.g., list of class names (strings)
-}
-payload = pickle.dumps(result_data)
-sock.sendall(struct.pack('>I', len(payload)) + payload)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 HOST = '0.0.0.0'
 PORT = 5001
+SOCKET_TIMEOUT = 30.0
 
-def receive_image(conn):
-    # 先接收 4 bytes，表示圖片大小
-    data_len = struct.unpack('>I', conn.recv(4))[0]
-    data = b''
-    while len(data) < data_len:
-        packet = conn.recv(4096)
-        if not packet:
-            break
-        data += packet
-    return cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+def receive_image(conn: socket.socket) -> Optional[np.ndarray]:
+    """
+    接收圖片數據，加入錯誤處理和超時機制
+    """
+    try:
+        # 設置超時
+        conn.settimeout(SOCKET_TIMEOUT)
+        
+        # 先接收 4 bytes，表示圖片大小
+        size_data = conn.recv(4)
+        if len(size_data) != 4:
+            logger.warning("Failed to receive complete size data")
+            return None
+            
+        data_len = struct.unpack('>I', size_data)[0]
+        
+        # 檢查數據大小是否合理 (最大50MB)
+        if data_len > 50 * 1024 * 1024:
+            logger.warning(f"Image size too large: {data_len} bytes")
+            return None
+            
+        logger.debug(f"Expecting {data_len} bytes of image data")
+        
+        data = b''
+        while len(data) < data_len:
+            remaining = data_len - len(data)
+            chunk_size = min(4096, remaining)
+            packet = conn.recv(chunk_size)
+            if not packet:
+                logger.warning("Connection closed while receiving image data")
+                break
+            data += packet
+            
+        if len(data) != data_len:
+            logger.warning(f"Incomplete image data: received {len(data)}, expected {data_len}")
+            return None
+            
+        # 解碼圖片
+        img = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if img is None:
+            logger.warning("Failed to decode image")
+            return None
+        return img
+        
+    except socket.timeout:
+        logger.warning("Socket timeout while receiving image")
+        return None
+    except Exception as e:
+        logger.error(f"Error receiving image: {e}")
+        return None
 
-def send_image(conn, image):
-    _, img_encoded = cv2.imencode('.jpg', image)
-    img_bytes = img_encoded.tobytes()
-    conn.sendall(struct.pack('>I', len(img_bytes)) + img_bytes)
+def send_result(conn: socket.socket, result_data: Dict[str, Any]) -> bool:
+    """
+    發送結果數據，加入錯誤處理
+    """
+    try:
+        payload = pickle.dumps(result_data)
+        
+        # 檢查payload大小
+        if len(payload) > 100 * 1024 * 1024:  # 100MB限制
+            logger.warning(f"Result payload too large: {len(payload)} bytes")
+            return False
+            
+        # 發送大小和數據
+        conn.sendall(struct.pack('>I', len(payload)) + payload)
+        logger.debug(f"Sent result: {len(payload)} bytes")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error sending result: {e}")
+        return False
 
 class LetterBox:
     def __init__(self, new_shape=(640, 640), auto=False, scaleFill=False, scaleup=True, center=True, stride=32):
@@ -232,10 +285,17 @@ def visualizer(image, results, labels, input_shape=(640, 640)):
         if det is None:
             continue
         
+        boxes = []
         # Draw each bounding box
         for i in range(det.shape[0]):
             x1, y1, x2, y2, conf, cls_id = det[i]
             cls_id = int(cls_id) + 1
+
+            boxes.append({
+                "cls": int(cls_id),
+                "conf": float(conf),
+                "xyxy": [float(x1), float(y1), float(x2), float(y2)]
+            })
             
             # Ensure coordinates are integers and within the image
             x1 = max(0, int(x1))
@@ -258,9 +318,7 @@ def visualizer(image, results, labels, input_shape=(640, 640)):
             brightness = sum(color) / 3
             text_color = (255, 255, 255) if brightness < 127 else (0, 0, 0)
             cv2.putText(image, label_text, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1)  
-    cv2.imshow()
-    cv2.waitKey(500)
-    return image
+    return image, boxes
 
 def xywh2xyxy(x):
     assert x.shape[-1] == 4, f"input shape last dimension expected 4 but input shape is {x.shape}"
@@ -310,27 +368,105 @@ COCO_CLASSES = [
     'book', 'clock', 'vase', 'scissors', 'teddy bear', 'hair drier', 'toothbrush'
 ]
 
-def analyze_yolo_output(output_data):
-    """Analyzing the structure of YOLO output"""
-    print(f"Output shape: {output_data.shape}")
-    
-    for i in range(0, min(84, output_data.shape[2]), 5):
-        segment = output_data[0, :, i:i+5]
-        print(f"The value range of the output index {i}~{i+4}: {np.min(segment)} ~ {np.max(segment)}")
-        print(f"The percentage of non-zero values for output indexes {i}~{i+4}: {np.mean(segment != 0) * 100:.2f}%")
-
-    for i in range(min(5, output_data.shape[1])):
-        box_data = output_data[0, i]
-        max_class_idx = np.argmax(box_data[5:])
-        max_class_conf = box_data[5 + max_class_idx]
-        print(f"box {i}: [{box_data[0]:.4f}, {box_data[1]:.4f}, {box_data[2]:.4f}, {box_data[3]:.4f}], " 
-              f"confidence: {box_data[4]:.4f}, highest class: {max_class_idx}, class confidence: {max_class_conf:.4f}")
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-m", "--tflite_model", type=str, required=True, help="Path to .tflite")
     parser.add_argument("-d", "--device", type=str, default='mdla3.0', choices = ['mdla3.0', 'mdla2.0', 'vpu'], help="Device name for acceleration")
     args = parser.parse_args()
+
+    if not os.path.exists(args.tflite_model):
+        raise FileNotFoundError(f"Model file doesn't exist: {args.tflite_model}")
+    
+    os.makedirs('./models', exist_ok=True)
+    os.makedirs('./bin', exist_ok=True)
+    logging.getLogger().setLevel(logging.DEBUG)
+
+    # 初始化 neuronrt.Interpreter
+    logger.info(f"Loading model: {args.tflite_model}")
+    interpreter = neuronrt.Interpreter(model_path=args.tflite_model, device=args.device)
+    interpreter.allocate_tensors()
+    input_details = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
+
+    # 獲取輸入形狀
+    if len(input_details) > 0 and len(input_details[0]['shape']) >= 3:
+        input_shape = tuple(input_details[0]['shape'][1:3])  # [batch, height, width, channels]
+        if input_shape[0] == 0 or input_shape[1] == 0:
+            input_shape = (640, 640)
+    else:
+        input_shape = (640, 640)
+    
+    logger.info(f"Input shape: {input_shape}")
+
+    # 啟動伺服器
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # 允許重用地址
+        s.bind((args.host, args.port))
+        s.listen(1)
+        logger.info(f"Server listening on {args.host}:{args.port}")
+        
+        while True:  # 外層循環處理多個連接
+            try:
+                conn, addr = s.accept()
+                logger.info(f"Connected by {addr}")
+                
+                with conn:
+                    while True:  # 內層循環處理單個連接的多個請求
+                        try:
+                            start_time = time.time()
+                            
+                            # 接收圖片
+                            img = receive_image(conn)
+                            if img is None:
+                                logger.info("No image received. Closing connection.")
+                                continue
+
+                            # 預處理
+                            input_data, transform_info = preprocess_image(img, input_shape)
+
+                            # 確保dtype正確
+                            input_dtype = input_details[0]['dtype']
+                            if input_data.dtype != input_dtype:
+                                input_data = input_data.astype(input_dtype)
+
+                            # 推論
+                            interpreter.set_tensor(input_details[0]['index'], input_data)
+                            interpreter.invoke()
+                            output_data = interpreter.get_tensor(output_details[0]['index'])
+
+                            # 後處理
+                            results = postprocess(output_data, transform_info, 
+                                                conf_thres=args.conf_thres, 
+                                                iou_thres=args.iou_thres)
+
+                            # 視覺化
+                            vis_img, boxes = visualizer(img.copy(), results, COCO_CLASSES, input_shape)
+
+                            # 準備結果
+                            result_data = {
+                                "image": vis_img,
+                                "boxes": boxes,
+                                "processing_time": time.time() - start_time
+                            }
+                            
+                            # 發送結果
+                            if not send_result(conn, result_data):
+                                break
+                                
+                            logger.info(f"Processing time: {result_data['processing_time']:.3f}s, "
+                                      f"Detected objects: {len(boxes)}")
+
+                        except Exception as e:
+                            logger.error(f"Error processing request: {e}")
+                            break
+                            
+            except KeyboardInterrupt:
+                logger.info("Server stopped by user")
+                break
+            except Exception as e:
+                logger.error(f"Server error: {e}")
+                continue
+
 
     # Check files
     if not os.path.exists(args.tflite_model):
@@ -366,7 +502,6 @@ if __name__ == "__main__":
                     if img is None:
                         print("No image received. Closing connection.")
                         break
-                    print("Received image from client")
 
                     input_data, transform_info = preprocess_image(img, input_shape)
 
@@ -385,46 +520,15 @@ if __name__ == "__main__":
                     results = postprocess(output_data, transform_info)
 
                     # 畫出結果
-                    vis_img = visualizer(img.copy(), results, COCO_CLASSES, input_shape)
+                    vis_img, boxes = visualizer(img.copy(), results, COCO_CLASSES, input_shape)
 
-                    # 回傳結果圖片（可選）
-                    send_image(conn, vis_img)
+                    result_data = {
+                        "image": vis_img,
+                        "boxes": boxes,
+                    }
+                    payload = pickle.dumps(result_data)
+                    conn.sendall(struct.pack('>I', len(payload)) + payload)
 
                 except Exception as e:
                     print(f"Error: {e}")
                     break
-
-        # with conn:
-        #     print(f"Connected by {addr}")
-        #     img = receive_image(conn)
-        #     print("Received image from client")
-
-        #     input_data, transform_info = preprocess_image(img, input_shape)
-            
-        #     # Ensure the input data type matches the desired type
-        #     input_dtype = input_details[0]['dtype']
-        #     if input_data.dtype != input_dtype:
-        #         print(f"Convert input data type from {input_data.dtype} to {input_dtype}.")
-        #         input_data = input_data.astype(input_dtype)
-            
-        #     # Setting the Input tensor
-        #     interpreter.set_tensor(input_details[0]['index'], input_data)
-
-        #     # Inference
-        #     start = time.time()
-        #     interpreter.invoke()
-        #     inference_time = time.time() - start
-        #     print(f"Reasoning complete, time taken: {inference_time:.4f} seconds")
-
-        #     # Post-process
-        #     output_data = interpreter.get_tensor(output_details[0]['index'])
-        #     # analyze_yolo_output(output_data)
-        #     output_data = output_data.transpose(0, 2, 1)    # Should be (1, 8400, 84)
-        #     results = postprocess(output_data, transform_info, conf_thres=0.25, iou_thres=0.45, nc=80)
-            
-        #     # Plotting result
-        #     output_image = visualizer(img, results, COCO_CLASSES)
-
-        #     # 傳回處理後的圖片
-        #     send_image(conn, output_image)
-        #     print("Processed image sent back to client")
