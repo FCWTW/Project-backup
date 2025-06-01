@@ -2,8 +2,8 @@
 import ros_numpy
 import rospy
 import time
-import cv_bridge
 import cv2
+import cv_bridge
 import message_filters
 import numpy as np
 import image_geometry
@@ -16,6 +16,7 @@ import sensor_msgs.point_cloud2 as pc2
 
 HOST = '172.18.0.1'
 PORT = 5001
+processing = False
 
 # 初始化ROS節點和YOLO模型
 rospy.init_node("yolo_detector")
@@ -30,21 +31,108 @@ bridge = cv_bridge.CvBridge()
 # Camera Model instance (for CameraInfo)
 cam_model = image_geometry.PinholeCameraModel()
 
-# 全局變數
-processing = False
+# Socket 連接狀態
+sock = None
+connection_established = False
 
-# 建立 socket 連線
-sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-sock.connect((HOST, PORT))
-rospy.loginfo("Connected to server at %s:%d", HOST, PORT)
+# 建立辨識索引
+COCO_CLASSES = {0: 'person', 1: 'bicycle', 2: 'car', 3: 'motorcycle', 4: 'airplane', 5: 'bus', 6: 'train', 7: 'truck', 8: 'boat', 9: 'traffic light', 10: 'fire hydrant', 11: 'stop sign', 12: 'parking meter', 13: 'bench', 14: 'bird', 15: 'cat', 16: 'dog', 17: 'horse', 18: 'sheep', 19: 'cow', 20: 'elephant', 21: 'bear', 22: 'zebra', 23: 'giraffe', 24: 'backpack', 25: 'umbrella', 26: 'handbag', 27: 'tie', 28: 'suitcase', 29: 'frisbee', 30: 'skis', 31: 'snowboard', 32: 'sports ball', 33: 'kite', 34: 'baseball bat', 35: 'baseball glove', 36: 'skateboard', 37: 'surfboard', 38: 'tennis racket', 39: 'bottle', 40: 'wine glass', 41: 'cup', 42: 'fork', 43: 'knife', 44: 'spoon', 45: 'bowl', 46: 'banana', 47: 'apple', 48: 'sandwich', 49: 'orange', 50: 'broccoli', 51: 'carrot', 52: 'hot dog', 53: 'pizza', 54: 'donut', 55: 'cake', 56: 'chair', 57: 'couch', 58: 'potted plant', 59: 'bed', 60: 'dining table', 61: 'toilet', 62: 'tv', 63: 'laptop', 64: 'mouse', 65: 'remote', 66: 'keyboard', 67: 'cell phone', 68: 'microwave', 69: 'oven', 70: 'toaster', 71: 'sink', 72: 'refrigerator', 73: 'book', 74: 'clock', 75: 'vase', 76: 'scissors', 77: 'teddy bear', 78: 'hair drier', 79: 'toothbrush'}
+
+def connect_to_host():
+    """建立到 host 的連接，包含重試機制"""
+    global sock, connection_established
+    max_retries = 5
+    retry_delay = 2.0
+    
+    for attempt in range(max_retries):
+        try:
+            if sock:
+                sock.close()
+            
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(10.0)  # 設置連接超時
+            sock.connect((HOST, PORT))
+            connection_established = True
+            rospy.loginfo("Successfully connected to server at %s:%d", HOST, PORT)
+            return True
+            
+        except socket.error as e:
+            rospy.logwarn(f"Connection attempt {attempt + 1} failed: {e}")
+            if attempt < max_retries - 1:
+                rospy.loginfo(f"Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+                retry_delay *= 1.5  # 指數退避
+            else:
+                rospy.logerr("Failed to connect after %d attempts", max_retries)
+                connection_established = False
+                return False
+    
+    return False
+
+def safe_recv(sock, size):
+    """安全的數據接收函數，確保接收完整數據"""
+    data = b''
+    while len(data) < size:
+        try:
+            packet = sock.recv(size - len(data))
+            if not packet:
+                raise socket.error("Connection closed by peer")
+            data += packet
+        except socket.timeout:
+            raise socket.error("Receive timeout")
+        except socket.error as e:
+            raise e
+    return data
+
+def send_image_and_receive_result(rgb_image):
+    """發送圖像並接收結果，包含錯誤處理"""
+    global sock, connection_established
+    
+    try:
+        # 編碼圖像
+        _, img_encoded = cv2.imencode('.jpg', rgb_image, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        img_bytes = img_encoded.tobytes()
+        
+        # 發送圖像大小和數據
+        sock.sendall(struct.pack('>I', len(img_bytes)))
+        sock.sendall(img_bytes)
+        rospy.logdebug("Image sent to host (%d bytes)", len(img_bytes))
+        
+        # 接收結果大小
+        size_data = safe_recv(sock, 4)
+        data_len = struct.unpack('>I', size_data)[0]
+        
+        # 接收結果數據
+        result_data = safe_recv(sock, data_len)
+        result = pickle.loads(result_data)
+        
+        rospy.logdebug("Received result from host (%d bytes)", data_len)
+        return result
+        
+    except socket.error as e:
+        rospy.logerr("Socket error during communication: %s", e)
+        connection_established = False
+        raise e
+    except Exception as e:
+        rospy.logerr("Error during image processing: %s", e)
+        raise e
 
 def callback(rgb_msg, depth_msg, depth_info_msg):
-    global processing
+    global processing, connection_established
+    
     if processing:
         return
     processing = True
+    
     try:
         start_time = time.time()
+
+        # 檢查連接狀態
+        if not connection_established:
+            rospy.logwarn("No connection to host, attempting to reconnect...")
+            if not connect_to_host():
+                rospy.logwarn("Cannot connect to host, skipping frame")
+                return
 
         # 1. 解析相機參數
         cam_model.fromCameraInfo(depth_info_msg)
@@ -65,26 +153,36 @@ def callback(rgb_msg, depth_msg, depth_info_msg):
             return
 
         # 3. 將圖片送回 host 推論
-        _, img_encoded = cv2.imencode('.jpg', rgb_image)
-        img_bytes = img_encoded.tobytes()
         try:
-            sock.sendall(struct.pack('>I', len(img_bytes)) + img_bytes)
-            rospy.loginfo("Image sent to host")
+            result_data = send_image_and_receive_result(rgb_image)
+            image = result_data["image"]
+            boxes = result_data["boxes"]
         except Exception as e:
-            rospy.logerr("Failed to send image: %s", e)
+            rospy.logerr("Failed to process image with host: %s", e)
+            # 嘗試重新連接
+            if not connect_to_host():
+                rospy.logwarn("Cannot reconnect, skipping frame")
+            return
 
-        # 接收偵測結果
-        data_len = struct.unpack('>I', sock.recv(4))[0]
-        data = b''
-        while len(data) < data_len:
-            packet = sock.recv(4096)
-            if not packet:
-                break
-            data += packet
-        result_data = pickle.loads(data)
-        image = result_data["image"]
-        boxes = result_data["boxes"]
-        names = result_data["names"]
+        # _, img_encoded = cv2.imencode('.jpg', rgb_image)
+        # img_bytes = img_encoded.tobytes()
+        # try:
+        #     sock.sendall(struct.pack('>I', len(img_bytes)) + img_bytes)
+        #     rospy.loginfo("Image sent to host")
+        # except Exception as e:
+        #     rospy.logerr("Failed to send image: %s", e)
+
+        # # 接收偵測結果
+        # data_len = struct.unpack('>I', sock.recv(4))[0]
+        # data = b''
+        # while len(data) < data_len:
+        #     packet = sock.recv(4096)
+        #     if not packet:
+        #         break
+        #     data += packet
+        # result_data = pickle.loads(data)
+        # image = result_data["image"]
+        # boxes = result_data["boxes"]
         # new_result = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
     
         # 4. 使用 numpy 優化的方式生成點雲
@@ -114,13 +212,13 @@ def callback(rgb_msg, depth_msg, depth_info_msg):
         
         # 創建一個索引陣列，用於標記點屬於哪個物體
         point_labels = np.zeros(len(scene_points), dtype=np.int32) - 1  # -1表示不屬於任何物體
-        
+
         # 5. 為每個物體框單獨處理
         for i, box in enumerate(boxes):
-            cls_id = int(box.cls)
-            cls_name = names[cls_id]
-            conf = float(box.conf.cpu().numpy())
-            xyxy = box.xyxy.cpu().numpy()[0]
+            cls_id = int(box['cls'])
+            cls_name = COCO_CLASSES[cls_id]
+            conf = float(box['conf'])
+            xyxy = box['xyxy']
             
             # 使用優化的方式標記物體框內的點
             u_min, v_min, u_max, v_max = map(int, [max(0, xyxy[0]), max(0, xyxy[1]), 
@@ -221,9 +319,9 @@ def callback(rgb_msg, depth_msg, depth_info_msg):
                     cv2.circle(image, (u, v), 3, (b, g, r), -1)  # OpenCV使用BGR
                 
                 # 添加深度信息文字
-                xyxy = box.xyxy.cpu().numpy()[0]
+                xyxy = box['xyxy']
                 u_min, v_min = map(int, [xyxy[0], xyxy[1]])
-                cls_name = names[int(box.cls)]
+                cls_name = COCO_CLASSES[int(box.cls)]
                 depth_text = f"depth: {min_depth:.2f}m"
                 
                 right_top_x = u_min  
@@ -243,6 +341,24 @@ def callback(rgb_msg, depth_msg, depth_info_msg):
         rospy.logerr(traceback.format_exc())
     finally:
         processing = False
+
+def cleanup():
+    """清理資源"""
+    global sock
+    if sock:
+        try:
+            sock.close()
+        except:
+            pass
+    rospy.loginfo("Resources cleaned up")
+
+# 初始連接
+if not connect_to_host():
+    rospy.logfatal("Cannot establish initial connection to host. Exiting.")
+    exit(1)
+
+# 註冊清理函數
+rospy.on_shutdown(cleanup)
 
 # 使用 message_filters 同步 RGB、深度影像和相機參數
 # 這邊要改成要接收的 rostopic

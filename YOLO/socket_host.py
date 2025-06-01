@@ -401,9 +401,9 @@ if __name__ == "__main__":
     # 啟動伺服器
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # 允許重用地址
-        s.bind((args.host, args.port))
+        s.bind((HOST, PORT))
         s.listen(1)
-        logger.info(f"Server listening on {args.host}:{args.port}")
+        logger.info(f"Server listening on {HOST}:{PORT}")
         
         while True:  # 外層循環處理多個連接
             try:
@@ -436,8 +436,8 @@ if __name__ == "__main__":
 
                             # 後處理
                             results = postprocess(output_data, transform_info, 
-                                                conf_thres=args.conf_thres, 
-                                                iou_thres=args.iou_thres)
+                                                conf_thres=0.25, 
+                                                iou_thres=0.45)
 
                             # 視覺化
                             vis_img, boxes = visualizer(img.copy(), results, COCO_CLASSES, input_shape)
