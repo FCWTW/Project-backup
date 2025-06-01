@@ -1,12 +1,12 @@
 <launch>
   <!-- 載入YOLO物件偵測節點 -->
-  <node pkg="orb_slam3_ros" type="yolo_detect.py" name="yolo_detector" output="screen" respawn="true">
+  <node pkg="yolo_ros" type="yolo_detect.py" name="yolo_detector" output="screen" respawn="true">
     <!-- 相機話題參數 -->
     <param name="camera_topic" value="/camera/color/image_raw"/>
   </node>
 
   <!-- Rviz視覺化 -->
-  <node pkg="rviz" type="rviz" name="rviz3" args="-d $(find orb_slam3_ros)/config/yolo.rviz">
+  <node pkg="rviz" type="rviz" name="rviz3" args="-d $(find yolo_ros)/config/yolo.rviz">
     <env name="QT_ENABLE_HIGHDPI_SCALING" value="0"/>
   </node>
 
