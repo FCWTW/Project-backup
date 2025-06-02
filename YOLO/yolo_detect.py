@@ -9,6 +9,7 @@ import numpy as np
 import image_geometry
 import struct
 import socket, pickle
+import sys
 
 from sensor_msgs.msg import Image, CameraInfo, PointCloud2, PointField
 from std_msgs.msg import Header
@@ -18,8 +19,17 @@ HOST = '172.18.0.1'
 PORT = 5001
 processing = False
 
+# 檢查並顯示 NumPy 版本信息
+rospy.loginfo(f"Python version: {sys.version}")
+rospy.loginfo(f"NumPy version: {np.__version__}")
+
 # 初始化ROS節點和YOLO模型
 rospy.init_node("yolo_detector")
+
+# 從 ROS 參數獲取處理頻率設定
+target_fps = rospy.get_param('~target_fps', 1.0)  # 默認每秒1次
+process_interval = 1.0 / target_fps
+rospy.loginfo(f"Target processing FPS: {target_fps}, interval: {process_interval:.3f}s")
 
 # 創建影像和點雲發布者
 det_image_pub = rospy.Publisher("/yolo/detection/image", Image, queue_size=5)
@@ -34,6 +44,11 @@ cam_model = image_geometry.PinholeCameraModel()
 # Socket 連接狀態
 sock = None
 connection_established = False
+
+# 頻率控制變數
+last_process_time = 0.0
+frame_count = 0
+skip_count = 0
 
 # 建立辨識索引
 COCO_CLASSES = {0: 'person', 1: 'bicycle', 2: 'car', 3: 'motorcycle', 4: 'airplane', 5: 'bus', 6: 'train', 7: 'truck', 8: 'boat', 9: 'traffic light', 10: 'fire hydrant', 11: 'stop sign', 12: 'parking meter', 13: 'bench', 14: 'bird', 15: 'cat', 16: 'dog', 17: 'horse', 18: 'sheep', 19: 'cow', 20: 'elephant', 21: 'bear', 22: 'zebra', 23: 'giraffe', 24: 'backpack', 25: 'umbrella', 26: 'handbag', 27: 'tie', 28: 'suitcase', 29: 'frisbee', 30: 'skis', 31: 'snowboard', 32: 'sports ball', 33: 'kite', 34: 'baseball bat', 35: 'baseball glove', 36: 'skateboard', 37: 'surfboard', 38: 'tennis racket', 39: 'bottle', 40: 'wine glass', 41: 'cup', 42: 'fork', 43: 'knife', 44: 'spoon', 45: 'bowl', 46: 'banana', 47: 'apple', 48: 'sandwich', 49: 'orange', 50: 'broccoli', 51: 'carrot', 52: 'hot dog', 53: 'pizza', 54: 'donut', 55: 'cake', 56: 'chair', 57: 'couch', 58: 'potted plant', 59: 'bed', 60: 'dining table', 61: 'toilet', 62: 'tv', 63: 'laptop', 64: 'mouse', 65: 'remote', 66: 'keyboard', 67: 'cell phone', 68: 'microwave', 69: 'oven', 70: 'toaster', 71: 'sink', 72: 'refrigerator', 73: 'book', 74: 'clock', 75: 'vase', 76: 'scissors', 77: 'teddy bear', 78: 'hair drier', 79: 'toothbrush'}
@@ -89,8 +104,8 @@ def send_image_and_receive_result(rgb_image):
     global sock, connection_established
     
     try:
-        # 編碼圖像
-        _, img_encoded = cv2.imencode('.jpg', rgb_image, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        # 編碼圖像 - 降低品質以減少傳輸量
+        _, img_encoded = cv2.imencode('.jpg', rgb_image, [cv2.IMWRITE_JPEG_QUALITY, 70])
         img_bytes = img_encoded.tobytes()
         
         # 發送圖像大小和數據
@@ -118,11 +133,26 @@ def send_image_and_receive_result(rgb_image):
         raise e
 
 def callback(rgb_msg, depth_msg, depth_info_msg):
-    global processing, connection_established
+    global processing, connection_established, last_process_time, frame_count, skip_count
+    
+    frame_count += 1
     
     if processing:
+        skip_count += 1
         return
+    
+    # 頻率控制：檢查是否到了處理時間
+    current_time = time.time()
+    if current_time - last_process_time < process_interval:
+        skip_count += 1
+        return  # 還沒到處理時間，跳過這一幀
+    
     processing = True
+    last_process_time = current_time
+    
+    # 每 100 幀報告一次統計信息
+    if frame_count % 100 == 0:
+        rospy.loginfo(f"Frame statistics: processed={frame_count-skip_count}, skipped={skip_count}, total={frame_count}")
     
     try:
         start_time = time.time()
@@ -149,10 +179,9 @@ def callback(rgb_msg, depth_msg, depth_info_msg):
             h, w = depth_image_meters.shape
         except cv_bridge.CvBridgeError as e:
             rospy.logerr(f"CV Bridge Error: {e}")
-            processing = False
             return
 
-        # 3. 將圖片送回 host 推論
+        # 3. 發送圖像並接收結果
         try:
             result_data = send_image_and_receive_result(rgb_image)
             image = result_data["image"]
@@ -163,31 +192,10 @@ def callback(rgb_msg, depth_msg, depth_info_msg):
             if not connect_to_host():
                 rospy.logwarn("Cannot reconnect, skipping frame")
             return
-
-        # _, img_encoded = cv2.imencode('.jpg', rgb_image)
-        # img_bytes = img_encoded.tobytes()
-        # try:
-        #     sock.sendall(struct.pack('>I', len(img_bytes)) + img_bytes)
-        #     rospy.loginfo("Image sent to host")
-        # except Exception as e:
-        #     rospy.logerr("Failed to send image: %s", e)
-
-        # # 接收偵測結果
-        # data_len = struct.unpack('>I', sock.recv(4))[0]
-        # data = b''
-        # while len(data) < data_len:
-        #     packet = sock.recv(4096)
-        #     if not packet:
-        #         break
-        #     data += packet
-        # result_data = pickle.loads(data)
-        # image = result_data["image"]
-        # boxes = result_data["boxes"]
-        # new_result = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
     
         # 4. 使用 numpy 優化的方式生成點雲
         # 先生成整個場景的點雲 (使用適當的採樣間隔)
-        step = 3  # 適當的採樣間隔，平衡點雲密度和處理速度
+        step = 4  # 增加採樣間隔，進一步減少計算量
         v_indices, u_indices = np.mgrid[0:h:step, 0:w:step]
         v_indices = v_indices.flatten()
         u_indices = u_indices.flatten()
@@ -212,7 +220,7 @@ def callback(rgb_msg, depth_msg, depth_info_msg):
         
         # 創建一個索引陣列，用於標記點屬於哪個物體
         point_labels = np.zeros(len(scene_points), dtype=np.int32) - 1  # -1表示不屬於任何物體
-
+        
         # 5. 為每個物體框單獨處理
         for i, box in enumerate(boxes):
             cls_id = int(box['cls'])
@@ -305,7 +313,7 @@ def callback(rgb_msg, depth_msg, depth_info_msg):
                 normalized_depths = (obj_depths - min_depth) / depth_range
                 
                 # 每隔幾個點繪製一次，減少密度但保持視覺效果
-                skip = 3  # 跳過的點數，可以根據需要調整
+                skip = 4  # 增加跳過的點數
                 for j in range(0, len(obj_u), skip):
                     u, v = int(obj_u[j]), int(obj_v[j])
                     depth_val = normalized_depths[j]
@@ -316,12 +324,12 @@ def callback(rgb_msg, depth_msg, depth_info_msg):
                     b = int(255 * depth_val)
                     
                     # 直接在偵測結果上繪製點
-                    cv2.circle(image, (u, v), 3, (b, g, r), -1)  # OpenCV使用BGR
+                    cv2.circle(image, (u, v), 2, (b, g, r), -1)  # 縮小點的大小
                 
                 # 添加深度信息文字
                 xyxy = box['xyxy']
                 u_min, v_min = map(int, [xyxy[0], xyxy[1]])
-                cls_name = COCO_CLASSES[int(box.cls)]
+                cls_name = COCO_CLASSES[int(box['cls'])]
                 depth_text = f"depth: {min_depth:.2f}m"
                 
                 right_top_x = u_min  
@@ -329,7 +337,7 @@ def callback(rgb_msg, depth_msg, depth_info_msg):
                 cv2.putText(image, depth_text, (right_top_x, right_top_y), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)  # 使用黃色
         
-        # 9. 發布帶有深度信息的偵測結果
+        # 8. 發布帶有深度信息的偵測結果
         det_image_pub.publish(bridge.cv2_to_imgmsg(image, encoding="bgr8"))
 
         process_time = time.time() - start_time
@@ -339,6 +347,8 @@ def callback(rgb_msg, depth_msg, depth_info_msg):
         rospy.logerr(f"處理圖像時出錯: {e}")
         import traceback
         rospy.logerr(traceback.format_exc())
+        # 連接可能已斷開，標記為未連接
+        connection_established = False
     finally:
         processing = False
 
@@ -378,7 +388,7 @@ ts = message_filters.ApproximateTimeSynchronizer(
 )
 ts.registerCallback(callback)
 
-rospy.loginfo(f"YOLO檢測器已啟動")
+rospy.loginfo(f"YOLO檢測器已啟動，處理頻率: {target_fps} FPS")
 rospy.loginfo(f"訂閱: RGB: {rgb_topic}, 深度: {depth_topic}, 相機參數: {depth_info_topic}")
 rospy.loginfo(f"發布標註影像到: /yolo/detection/image")
 rospy.loginfo(f"發布場景點雲到: /yolo/scene/pointcloud")

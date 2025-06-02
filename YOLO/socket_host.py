@@ -51,12 +51,64 @@ def receive_image(conn: socket.socket) -> Optional[np.ndarray]:
         if len(data) != data_len:
             logger.warning(f"Incomplete image data: received {len(data)}, expected {data_len}")
             return None
+        
+        # === 添加調試信息 ===
+        # 檢查原始數據的格式
+        logger.info(f"Received raw data size: {len(data)} bytes")
+        
+        # 檢查文件頭以確定圖片格式
+        if len(data) >= 4:
+            header = data[:4]
+            if header[:2] == b'\xff\xd8':
+                logger.info("Detected JPEG format")
+            elif header == b'\x89PNG':
+                logger.info("Detected PNG format")
+            elif header[:2] == b'BM':
+                logger.info("Detected BMP format")
+            else:
+                logger.info(f"Unknown format, header: {header.hex()}")
             
         # 解碼圖片
         img = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
         if img is None:
             logger.warning("Failed to decode image")
+            # 嘗試不同的解碼方式
+            logger.info("Trying alternative decoding methods...")
+            
+            # 嘗試直接讀取為numpy array（如果是原始像素數據）
+            try:
+                # 假設可能是原始RGB數據，嘗試不同的形狀
+                total_pixels = len(data) // 3
+                possible_shapes = []
+                
+                # 常見的圖片尺寸
+                for width in [640, 480, 320, 1280, 1920]:
+                    if total_pixels % width == 0:
+                        height = total_pixels // width
+                        possible_shapes.append((height, width, 3))
+                
+                logger.info(f"Possible shapes for raw data: {possible_shapes}")
+                
+                if possible_shapes:
+                    # 嘗試第一個可能的形狀
+                    shape = possible_shapes[0]
+                    img = np.frombuffer(data, dtype=np.uint8).reshape(shape)
+                    logger.info(f"Successfully reshaped as raw data: {shape}")
+                
+            except Exception as reshape_error:
+                logger.error(f"Failed to reshape as raw data: {reshape_error}")
+                
             return None
+        
+        # logger.info(f"Decoded image shape: {img.shape}")
+        # logger.info(f"Decoded image dtype: {img.dtype}")
+        # logger.info(f"Decoded image min/max values: {img.min()}/{img.max()}")
+        
+        # 檢查圖片是否有異常值
+        if img.max() <= 1.0:
+            logger.warning("Image values seem to be normalized (0-1), might need scaling")
+        elif img.max() > 255:
+            logger.warning("Image values exceed 255, might be in wrong format")        
         return img
         
     except socket.timeout:
@@ -64,6 +116,8 @@ def receive_image(conn: socket.socket) -> Optional[np.ndarray]:
         return None
     except Exception as e:
         logger.error(f"Error receiving image: {e}")
+        import traceback
+        logger.error(f"Full traceback: {traceback.format_exc()}")
         return None
 
 def send_result(conn: socket.socket, result_data: Dict[str, Any]) -> bool:
@@ -411,6 +465,7 @@ if __name__ == "__main__":
                 logger.info(f"Connected by {addr}")
                 
                 with conn:
+                    number=0
                     while True:  # 內層循環處理單個連接的多個請求
                         try:
                             start_time = time.time()
@@ -435,12 +490,15 @@ if __name__ == "__main__":
                             output_data = interpreter.get_tensor(output_details[0]['index'])
 
                             # 後處理
+                            output_data = output_data.transpose(0, 2, 1)
                             results = postprocess(output_data, transform_info, 
                                                 conf_thres=0.25, 
                                                 iou_thres=0.45)
 
                             # 視覺化
-                            vis_img, boxes = visualizer(img.copy(), results, COCO_CLASSES, input_shape)
+                            vis_img, boxes = visualizer(img, results, COCO_CLASSES, input_shape)
+                            cv2.imwrite(f'/home/ubuntu/MTK-genio-demo/tmp/vis_{number}.jpg', vis_img)
+                            number+=1
 
                             # 準備結果
                             result_data = {
@@ -466,69 +524,3 @@ if __name__ == "__main__":
             except Exception as e:
                 logger.error(f"Server error: {e}")
                 continue
-
-
-    # Check files
-    if not os.path.exists(args.tflite_model):
-        raise FileNotFoundError(f"Model file doesn't exist: {args.tflite_model}")
-    
-    os.makedirs('./models', exist_ok=True)
-    os.makedirs('./bin', exist_ok=True)
-
-    # Initialize neuronrt.Interpreter
-    interpreter = neuronrt.Interpreter(model_path=args.tflite_model, device=args.device)
-    interpreter.allocate_tensors()
-    input_details = interpreter.get_input_details()
-    output_details = interpreter.get_output_details()
-
-    # Pre-process image
-    if len(input_details) > 0 and len(input_details[0]['shape']) >= 3:
-        input_shape = tuple(input_details[0]['shape'][1:3])  # [batch, height, width, channels]
-        if input_shape[0] == 0 or input_shape[1] == 0:
-            input_shape = (640, 640)
-    else:
-        input_shape = (640, 640)
-
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind((HOST, PORT))
-        s.listen(1)
-        print(f"Server listening on {HOST}:{PORT}")
-        conn, addr = s.accept()
-        with conn:
-            print(f"Connected by {addr}")
-            while True:
-                try:
-                    img = receive_image(conn)
-                    if img is None:
-                        print("No image received. Closing connection.")
-                        break
-
-                    input_data, transform_info = preprocess_image(img, input_shape)
-
-                    # 確保 dtype 正確
-                    input_dtype = input_details[0]['dtype']
-                    if input_data.dtype != input_dtype:
-                        input_data = input_data.astype(input_dtype)
-
-                    # 推論
-                    interpreter.set_tensor(input_details[0]['index'], input_data)
-                    interpreter.invoke()
-
-                    output_data = interpreter.get_tensor(output_details[0]['index'])
-
-                    # 後處理
-                    results = postprocess(output_data, transform_info)
-
-                    # 畫出結果
-                    vis_img, boxes = visualizer(img.copy(), results, COCO_CLASSES, input_shape)
-
-                    result_data = {
-                        "image": vis_img,
-                        "boxes": boxes,
-                    }
-                    payload = pickle.dumps(result_data)
-                    conn.sendall(struct.pack('>I', len(payload)) + payload)
-
-                except Exception as e:
-                    print(f"Error: {e}")
-                    break
