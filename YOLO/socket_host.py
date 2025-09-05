@@ -372,7 +372,7 @@ def visualizer(image, results, labels, input_shape=(640, 640)):
             brightness = sum(color) / 3
             text_color = (255, 255, 255) if brightness < 127 else (0, 0, 0)
             cv2.putText(image, label_text, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1)  
-    return image, boxes
+    return image, boxes 
 
 def xywh2xyxy(x):
     assert x.shape[-1] == 4, f"input shape last dimension expected 4 but input shape is {x.shape}"

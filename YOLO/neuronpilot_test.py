@@ -5,7 +5,7 @@ from utils.neuronpilot import neuronrt
 import time, argparse
 
 '''
-Test single image with NeuroPilot SDK
+Test single image with NeuroPilot SDK and yolov8.tflite
 
 Source:
 https://github.com/R300-AI/ITRI-AI-Hub

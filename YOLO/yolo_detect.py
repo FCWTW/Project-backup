@@ -27,7 +27,7 @@ rospy.loginfo(f"NumPy version: {np.__version__}")
 rospy.init_node("yolo_detector")
 
 # 從 ROS 參數獲取處理頻率設定
-target_fps = rospy.get_param('~target_fps', 1.0)  # 默認每秒1次
+target_fps = rospy.get_param('~target_fps', 1.0)
 process_interval = 1.0 / target_fps
 rospy.loginfo(f"Target processing FPS: {target_fps}, interval: {process_interval:.3f}s")
 
